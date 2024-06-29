@@ -1,0 +1,469 @@
+
+#include <Arduino.h>
+#include "driver/i2s.h"
+#include <ArduinoJson.h>
+#include <TinyGPS++.h>
+#include <Wire.h>
+#include <Adafruit_SHT31.h>
+#include <math.h>
+#include <stdlib.h>
+#include <FFT.h> // Include FFT library for Arduino
+#include <SPIFFS.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <esp_now.h>
+// Define constants for FFT computation
+#define FFT_SIZE 256             // FFT size (must be a power of 2)
+#define SAMPLING_FREQUENCY 16000 // Sampling frequency of the input signal (Hz)
+
+// Define constants for low-pass filter
+// Constants for the low-pass filter
+#define LPF_ALPHA 0.1 // Smoothing factor for the low-pass filter
+// Constants for the spectral subtraction algorithm
+#define ALPHA 0.5 // Smoothing factor for the noise estimate
+#define BETA 1.5  // Over-subtraction factor for noise estimate
+
+// Define constants for I2S configuration
+#define I2S_SAMPLE_RATE (16000)                         // Sample rate of the I2S microphone
+#define I2S_CHANNEL_NUM (1)                             // Mono audio channel
+#define I2S_BITS_PER_SAMPLE (I2S_BITS_PER_SAMPLE_16BIT) // 16-bit audio samples
+
+// Define constants for processing and logging hive conditions
+#define NUM_SAMPLES (64)                // Number of samples to process
+#define QUEEN_DETECTION_THRESHOLD (0.5) // Threshold for queen detection
+#define BROOD_DETECTION_THRESHOLD (0.6) // Threshold for brood detection
+#define HONEY_DETECTION_THRESHOLD (0.7) // Threshold for honey detection
+#define RAMP_DETECTION_THRESHOLD (0.8)  // Threshold for ramp detection
+
+// Initialize GPS sensor
+TinyGPSPlus gps;
+
+// Initialize SHT sensor
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
+
+// Must match the receiver structure
+typedef struct struct_message
+{
+    char diamond_UID[16];
+    float temperature;
+    float humidity;
+    uint8_t audio_data[NUM_SAMPLES];
+    char hive_condition[100]; // Placeholder for hive condition
+} struct_message;
+
+// Create a struct_message called myData
+struct_message myData;
+
+// MAC Address of the receiver (Badger)
+uint8_t broadcastAddress[] = {0x24, 0x6F, 0x28, 0xA1, 0xB2, 0xC3};
+
+// Callback when data is sent
+void onSent(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+    Serial.print("\r\nLast Packet Send Status:\t");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
+
+float applyLowPassFilter(float currentSample, float previousFilteredSample)
+{
+    // Apply a simple low-pass filter to reduce noise
+    return (1 - LPF_ALPHA) * previousFilteredSample + LPF_ALPHA * currentSample;
+}
+
+/**
+ * @brief Applies a simple low-pass filter to reduce noise in the input data.
+ *
+ * This function applies a low-pass filter to each sample in the input
+ * data array. The filtered data is then copied back to the input array.
+ *
+ * @param data Pointer to the input data array.
+ * @param numSamples The number of samples in the input data array.
+ */
+void applyNoiseReduction(int16_t *data, int numSamples)
+{
+    // Array to store the filtered data
+    float filteredData[numSamples];
+
+    // Initialize with the first sample
+    float previousFilteredSample = data[0];
+
+    // Apply low-pass filter to each sample in the data
+    for (int i = 0; i < numSamples; i++)
+    {
+        // Apply the low-pass filter to the current sample and the previous filtered sample
+        filteredData[i] = applyLowPassFilter(data[i], previousFilteredSample);
+
+        // Update the previous filtered sample for the next iteration
+        previousFilteredSample = filteredData[i];
+    }
+
+    // Copy the filtered data back to the original data array
+    for (int i = 0; i < numSamples; i++)
+    {
+        // Copy the filtered sample back to the input array
+        data[i] = (int16_t)filteredData[i];
+    }
+}
+void applyHammingWindow(int16_t *data, int numSamples)
+{
+    const float alpha = 0.54; // Hamming window coefficient
+    const float beta = 0.46;  // Hamming window coefficient
+
+    for (int i = 0; i < numSamples; i++)
+    {
+        float windowValue = alpha - beta * cos(2 * PI * i / (numSamples - 1));
+        data[i] *= windowValue;
+    }
+}
+
+/**
+ * @brief Computes the power spectral density (PSD) of a signal.
+ *
+ * This function computes the PSD of a given signal using the Fast Fourier
+ * Transform (FFT). The PSD is the magnitude squared of each frequency
+ * component of the signal. The PSD is then normalized by dividing it by
+ * the FFT size and the sampling frequency.
+ *
+ * @param data Pointer to the input signal data.
+ * @param numSamples The number of samples in the input signal.
+ * @param psd Pointer to an array where the computed PSD will be stored.
+ */
+void computePSD(int16_t *data, int numSamples, float *psd)
+{
+    // Configure FFT parameters
+    // const int FFT_SIZE = numSamples;          // FFT size is equal to the number of samples
+    // const float SAMPLING_FREQUENCY = 16000.0; // Sample rate in Hz
+
+    // Create an instance of the FFT configuration struct
+    fft_config_t *config = fft_init(FFT_SIZE, FFT_REAL, FFT_FORWARD, NULL, NULL);
+
+    // Perform FFT computation
+    // fft_execute(fft_config);
+    // Perform windowing on the input data using Hamming window
+    // Note: You may need to convert the int16_t data to float if the library expects float input
+    // For simplicity, we'll assume the input data is already in float format
+    // fft_windowing(data, data, NULL, FFT_SIZE, FFT_HAMMING);
+    applyHammingWindow(data, numSamples);
+    // Execute the FFT operation
+    fft_execute(config);
+
+    // Calculate the PSD by computing the magnitude squared of each frequency component
+    for (int i = 0; i < FFT_SIZE / 2; i++)
+    {
+        // Magnitude squared of each frequency component
+        float magnitudeSquared = data[i] * data[i];
+
+        // Normalize the PSD by dividing it by the FFT size and the sampling frequency
+        psd[i] = magnitudeSquared / (float(FFT_SIZE) * SAMPLING_FREQUENCY);
+    }
+
+    // Destroy the FFT configuration and free memory
+    fft_destroy(config);
+}
+
+/**
+ * @brief Performs spectral subtraction to remove noise from a signal.
+ *
+ * This function takes a signal as input and performs spectral subtraction
+ * to estimate and remove noise. The function estimates the power spectral
+ * density (PSD) of the input signal and uses a running average to estimate
+ * the noise PSD. It then applies spectral subtraction to remove the noise
+ * from the signal.
+ *
+ * @param data Pointer to the input signal data.
+ * @param numSamples The number of samples in the input signal.
+ */
+void spectralSubtraction(int16_t *data, int numSamples)
+{
+    // Compute the power spectral density (PSD) of the input signal
+    float inputPSD[numSamples]; // Array to store the PSD of the input signal
+    computePSD(data, numSamples, inputPSD);
+
+    // Estimate the noise PSD using a running average
+    float noisePSD[numSamples]; // Static variable to preserve state between function calls
+    for (int i = 0; i < numSamples; i++)
+    {
+        // Update the estimate of the noise PSD using a running average
+        noisePSD[i] = ALPHA * noisePSD[i] + (1 - ALPHA) * inputPSD[i];
+    }
+
+    // Perform spectral subtraction to remove noise
+    for (int i = 0; i < numSamples; i++)
+    {
+        // Compute the gain to subtract the noise from the signal
+        float gain = 1.0 - BETA * noisePSD[i] / inputPSD[i];
+        // Apply spectral subtraction to remove the noise from the signal
+        data[i] = (int16_t)(gain * data[i]);
+    }
+}
+
+/**
+ * @brief Setup function is called once at the beginning of program execution.
+ *
+ * This function initializes the serial communication, configures I2S,
+ * initializes I2C communication, and initializes the SHT31 sensor.
+ * It also initializes SPIFFS for logging data to a file if needed.
+ * If SPIFFS initialization fails, it prints an error message and stops the program.
+ *
+ */
+
+/**
+ * @brief Setup the I2S driver for receiving audio data.
+ *
+ * This function configures and installs the I2S driver for receiving audio data.
+ * It sets the I2S mode to receive, configures the sample rate, bits per sample,
+ * channel format, communication format, interrupt allocation, DMA buffer count,
+ * DMA buffer length, and whether to use the internal APLL (Audio PLL).
+ * It also sets the I2S pins, configures the I2S input format, and starts the I2S driver.
+ *
+ * @throws None
+ */
+void setupI2S()
+{
+    // I2S configuration
+    i2s_config_t i2s_config = {
+        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX), // I2S receive mode
+        .sample_rate = I2S_SAMPLE_RATE,                    // Sample rate
+        .bits_per_sample = I2S_BITS_PER_SAMPLE,            // Bits per sample
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,       // Mono channel
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S, // Communication format
+        .intr_alloc_flags = 0,                             // Default interrupt allocation
+        .dma_buf_count = 8,                                // Number of DMA buffers
+        .dma_buf_len = NUM_SAMPLES,                        // Size of each DMA buffer
+        .use_apll = false                                  // Use the internal APLL (Audio PLL)
+    };
+
+    // Install and configure the I2S driver
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+
+    // Set pins for I2S
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = 26,                  // Back clock pin
+        .ws_io_num = 22,                   // Word select pin
+        .data_out_num = I2S_PIN_NO_CHANGE, // Data out pin
+        .data_in_num = 25                  // Data in pin
+    };
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+
+    // Configure I2S input format
+    i2s_set_clk(I2S_NUM_0, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE, I2S_CHANNEL_MONO);
+}
+
+/**
+ * Calculates the percentage of samples in the given data array that are
+ * above the given threshold.
+ *
+ * @param data The array of samples.
+ * @param threshold The threshold to compare against.
+ *
+ * @return The percentage of samples above the threshold.
+ */
+float calculateDetectionPercentage(int16_t *data, float threshold)
+{
+    // Apply noise reduction to the data array before calculating the percentage
+    applyNoiseReduction(data, NUM_SAMPLES);
+
+    // Apply spectral subtraction to further reduce noise in the data array
+    spectralSubtraction(data, NUM_SAMPLES);
+
+    // Count the number of samples above the threshold
+    int count = 0;
+    for (int i = 0; i < NUM_SAMPLES; i++)
+    {
+        // Assuming 16-bit signed integers
+        if (data[i] > threshold * INT16_MAX)
+        {
+            count++;
+        }
+    }
+
+    // Calculate the percentage of samples above the threshold
+    return (float)count / NUM_SAMPLES * 100.0;
+}
+
+/**
+ * Logs the hive conditions and sensor data to a JSON file on SPIFFS.
+ *
+ * @param queen_percentage The percentage of ADC readings that were above the queen detection threshold.
+ * @param brood_percentage The percentage of ADC readings that were above the brood detection threshold.
+ * @param honey_percentage The percentage of ADC readings that were above the honey detection threshold.
+ * @param ramp_percentage The percentage of ADC readings that were above the ramp detection threshold.
+ * @param temperature The temperature in degrees Celsius.
+ * @param humidity The relative humidity in percent.
+ */
+void logHiveConditions(float queen_percentage, float brood_percentage,
+                       float honey_percentage, float ramp_percentage,
+                       float temperature, float humidity)
+{
+    // Create a JSON object to hold hive conditions and sensor data
+    StaticJsonDocument<500> jsonDoc;
+
+    // Log queen detection status and percentage
+    jsonDoc["hive_condition"]["queen_status"] = (queen_percentage >= QUEEN_DETECTION_THRESHOLD) ? "healthy" : "unhealthy";
+    jsonDoc["hive_condition"]["queen_detection_percentage"] = queen_percentage;
+
+    // Log brood detection status and percentage
+    jsonDoc["hive_condition"]["brood_status"] = (brood_percentage >= BROOD_DETECTION_THRESHOLD) ? "normal" : "abnormal";
+    jsonDoc["hive_condition"]["brood_detection_percentage"] = brood_percentage;
+
+    // Log honey detection status and percentage
+    jsonDoc["hive_condition"]["honey_status"] = (honey_percentage >= HONEY_DETECTION_THRESHOLD) ? "abundant" : "scarce";
+    jsonDoc["hive_condition"]["honey_detection_percentage"] = honey_percentage;
+
+    // Log ramp detection status and percentage
+    jsonDoc["hive_condition"]["ramp_status"] = (ramp_percentage >= RAMP_DETECTION_THRESHOLD) ? "normal" : "blocked";
+    jsonDoc["hive_condition"]["ramp_detection_percentage"] = ramp_percentage;
+
+    // Log temperature and humidity
+    jsonDoc["temperature"] = temperature;
+    jsonDoc["humidity"] = humidity;
+
+    // Serialize JSON to string and print
+    String jsonString;
+    serializeJson(jsonDoc, jsonString);
+    Serial.println(jsonString);
+
+    // Save JSON to file on SPIFFS (if needed)
+    File file = SPIFFS.open("/hive_conditions.json", FILE_WRITE);
+    if (!file)
+    {
+        Serial.println("Failed to open file for writing");
+        return;
+    }
+    serializeJson(jsonDoc, file);
+    file.close();
+}
+
+void setup()
+{
+    // Begin serial communication at 115200 baud rate
+    Serial.begin(115200);
+
+    // Initialize and configure I2S
+    setupI2S();
+
+    // Initialize I2C communication
+    Wire.begin();
+
+    // Initialize SHT31 sensor with address 0x44
+    sht31.begin(0x44);
+
+    // Initialize SPIFFS for logging data to a file if needed
+    if (!SPIFFS.begin(true))
+    {
+        // Print error message if SPIFFS initialization fails
+        Serial.println("SPIFFS initialization failed!");
+
+        // Stop execution if SPIFFS initialization fails
+        while (1)
+        {
+        };
+    }
+    // Set device as a Wi-Fi Station
+    WiFi.mode(WIFI_STA);
+    Serial.println("ESPNow/Basic/Sender");
+
+    // Init ESP-NOW
+    if (esp_now_init() != ESP_OK)
+    {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+
+    // Register send callback
+    esp_now_register_send_cb(onSent);
+
+    // Register peer
+    esp_now_peer_info_t peerInfo;
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    // Add peer
+    if (esp_now_add_peer(&peerInfo) != ESP_OK)
+    {
+        Serial.println("Failed to add peer");
+        return;
+    }
+    // Set Diamond UID
+    char name[50] = "DIAMOND1";
+    strncpy(myData.diamond_UID, name, sizeof(myData.diamond_UID));
+}
+
+/**
+ * The main loop of the program.
+ * This function continuously reads data from the GPS sensor, I2S microphone,
+ * and SHT sensor, processes the data, and logs the hive conditions and sensor
+ * data to Serial and/or file.
+ */
+void loop()
+{
+    // Read data from GPS sensor
+    // This loop reads data from the GPS sensor and processes it if available
+    while (Serial1.available() > 0)
+    {
+        // Decode the GPS data
+        if (gps.encode(Serial1.read()))
+        {
+            // Process GPS data
+            // This section extracts the latitude and longitude from the GPS data
+            float latitude = gps.location.lat();
+            float longitude = gps.location.lng();
+        }
+    }
+
+    // Read data from the I2S microphone
+    // This section reads data from the I2S microphone and processes it
+    size_t bytes_read;
+    int16_t data[NUM_SAMPLES];
+    i2s_read(I2S_NUM_0, data, sizeof(data), &bytes_read, portMAX_DELAY);
+    // Collect audio data
+    // size_t bytes_read;
+    i2s_read(I2S_NUM_0, myData.audio_data, sizeof(myData.audio_data), &bytes_read, portMAX_DELAY);
+
+    // myData.audio_data = data;
+    //  Process audio data and calculate detection percentages
+    //  This section processes the audio data and calculates the detection percentages
+    float queen_detection_percentage = calculateDetectionPercentage(data, QUEEN_DETECTION_THRESHOLD);
+    float brood_detection_percentage = calculateDetectionPercentage(data, BROOD_DETECTION_THRESHOLD);
+    float honey_detection_percentage = calculateDetectionPercentage(data, HONEY_DETECTION_THRESHOLD);
+    float ramp_detection_percentage = calculateDetectionPercentage(data, RAMP_DETECTION_THRESHOLD);
+
+    // Read data from SHT sensor
+    // This section reads data from the SHT sensor and processes it
+    float temperature = sht31.readTemperature();
+    float humidity = sht31.readHumidity();
+    myData.temperature = temperature;
+    myData.humidity = humidity;
+    // Log hive conditions and sensor data to Serial and/or file
+    // This section logs the hive conditions and sensor data to Serial and/or file
+    logHiveConditions(queen_detection_percentage, brood_detection_percentage,
+                      honey_detection_percentage, ramp_detection_percentage,
+                      temperature, humidity);
+    // Placeholder for hive condition data
+     snprintf(myData.hive_condition, sizeof(myData.hive_condition), 
+        "queen_status:%s, queen_detection_percentage:%d, "
+        "brood_status:%s, brood_detection_percentage:%d, "
+        "honey_status:%s, honey_detection_percentage:%d, "
+        "ramp_status:%s, ramp_detection_percentage:%d", 
+        (queen_detection_percentage >= QUEEN_DETECTION_THRESHOLD) ? "healthy" : "unhealthy", queen_detection_percentage,
+        (brood_detection_percentage >= BROOD_DETECTION_THRESHOLD) ? "normal" : "abnormal", brood_detection_percentage,
+        (honey_detection_percentage >= HONEY_DETECTION_THRESHOLD) ? "abundant" : "scarce", honey_detection_percentage,
+        (ramp_detection_percentage >= RAMP_DETECTION_THRESHOLD) ? "normal" : "blocked", ramp_detection_percentage);
+
+    
+    //strcpy(myData.hive_condition, "healthy hive, normal temperature, normal humidity");
+    // Send message via ESP-NOW
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&myData, sizeof(myData));
+
+    if (result == ESP_OK)
+    {
+        Serial.println("Sent with success");
+    }
+    else
+    {
+        Serial.println("Error sending the data");
+    }
+    //  delay based on our application's needs
+    delay(100);
+}

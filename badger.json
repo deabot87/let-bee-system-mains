@@ -1,0 +1,69 @@
+{
+  "badger_device": {
+    "badger_UID": "BADGER123",
+    "location": {
+      "latitude": 37.7749,
+      "longitude": -122.4194
+    },
+    "diamonds": [
+      {
+        "diamond_UID": "DIAMOND_MAC_1",
+        "sensor_data": {
+          "timestamp": "2023-10-30T12:00:00Z",
+          "temperature": 25.5,
+          "humidity": 60.2
+        },
+        "audio_data": {
+          "timestamp": "2023-10-30T12:00:00Z",
+          "sample_rate": 16000,
+          "duration_seconds": 5
+        },
+        "hive_condition": {
+          "queen_status": "healthy",
+          "hive_status": [
+            "sick hive",
+            "healthy hive",
+            "high temperature",
+            "low temperature",
+            "high humidity",
+            "low humidity",
+            "healthy temperature",
+            "healthy humidity",
+            "queen right",
+            "queenless",
+            "healthy colony",
+            "unhealthy colony"
+          ]
+        }
+      },
+      {
+        "diamond_UID": "DIAMOND_MAC_2",
+        "sensor_data": {
+          "timestamp": "2023-10-30T12:00:00Z",
+          "temperature": 28.1,
+          "humidity": 58.7
+        },
+        "audio_data": {
+          "timestamp": "2023-10-30T12:00:00Z",
+          "sample_rate": 16000,
+          "duration_seconds": 5
+        },
+        "hive_condition": {
+          "queen_status": "healthy",
+          "hive_status": [
+            "healthy hive",
+            "high temperature",
+            "low humidity",
+            "queen right",
+            "unhealthy colony"
+          ]
+        }
+      }
+    ],
+    "device_info": {
+      "device_id": "ABC123",
+      "firmware_version": "1.0.0",
+      "battery_level": 75
+    }
+  }
+}
